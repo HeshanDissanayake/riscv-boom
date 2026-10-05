@@ -210,6 +210,12 @@ class FpPipeline(implicit p: Parameters) extends BoomModule with tile.HasFPUPara
   }
   require (w_cnt == fregfile.io.write_ports.length)
 
+  // Register file usage monitor (passive observer, see boom.monitors)
+  boomParams.regfileMonitor.foreach { mp =>
+    boom.monitors.RegFileMonitor("fp", tileId, numFpPhysRegs, iss_valids, iss_uops, 3, RT_FLT,
+      fregfile.io.write_ports, mp)
+  }
+
   val fpiu_unit = exe_units.fpiu_unit
   val fpiu_is_sdq = fpiu_unit.io.ll_iresp.bits.uop.uopc === uopSTA
   io.to_int.valid := fpiu_unit.io.ll_iresp.fire && !fpiu_is_sdq

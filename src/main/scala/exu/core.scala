@@ -1184,6 +1184,12 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
   }
   require(w_cnt == iregfile.io.write_ports.length)
 
+  // Register file usage monitor (passive observer, see boom.monitors)
+  boomParams.regfileMonitor.foreach { mp =>
+    boom.monitors.RegFileMonitor("int", tileId, numIntPhysRegs, iss_valids, iss_uops, 2, RT_FIX,
+      iregfile.io.write_ports, mp)
+  }
+
   if (enableSFBOpt) {
     pregfile.io.write_ports(0).valid     := jmp_unit.io.iresp.valid && jmp_unit.io.iresp.bits.uop.is_sfb_br
     pregfile.io.write_ports(0).bits.addr := jmp_unit.io.iresp.bits.uop.pdst
