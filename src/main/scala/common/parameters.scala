@@ -18,7 +18,7 @@ import freechips.rocketchip.devices.tilelink.{BootROMParams, CLINTParams, PLICPa
 import boom.ifu._
 import boom.exu._
 import boom.lsu._
-import boom.monitors.{RegFileMonitorParams}
+import boom.monitors.{RegFileMonitorParams, MonitorParams}
 
 /**
  * Default BOOM core parameters
@@ -105,7 +105,9 @@ case class BoomCoreParams(
   enableMemtracePrintf: Boolean = false,
 
   /* monitors (passive observers, see boom.monitors) */
-  regfileMonitor: Option[RegFileMonitorParams] = None
+  regfileMonitor: Option[RegFileMonitorParams] = None,
+  exeUnitMonitor: Option[MonitorParams] = None,
+  freeListMonitor: Option[MonitorParams] = None
 
 // DOC include end: BOOM Parameters
 ) extends freechips.rocketchip.tile.CoreParams

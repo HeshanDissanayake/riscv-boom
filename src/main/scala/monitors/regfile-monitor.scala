@@ -6,7 +6,7 @@
 // read and written. Counts are collected over fixed windows of `windowCycles`
 // cycles; at the end of each window the counts are snapshotted, the live
 // counters reset, and the snapshot is streamed out on `io.dump` one register
-// per cycle as (window, preg, reads, writes).
+// per cycle as (window, row = preg, values = reads, writes).
 //
 // The monitor does not modify the register file or the register-read stage.
 // It is instantiated by the parent (core / fp-pipeline) only when
@@ -18,12 +18,9 @@
 // register file registers its read address, so read events are delayed one
 // cycle to count them in the cycle the array is actually accessed.
 //
-// Output sinks (RTL simulation only):
-//  - dpiLog:    a DPI-C BlackBox writes the dump stream to a binary file
-//               (see csrc/regfile_monitor.cc for the format). At the end of
-//               simulation it also writes the trailing partial window.
-//  - printDump: printf each record (debug).
-// Both must be off for FPGA (FireSim) builds.
+// Windowing, snapshot/streaming and the output sinks (DPI-C binary log,
+// printf) live in MonitorLogger. The log has fields reads/writes with one row
+// per physical register.
 
 package boom.monitors
 
@@ -49,14 +46,6 @@ case class RegFileMonitorParams(
   dpiLog: Boolean = true,
   printDump: Boolean = false)
 
-class RegFileMonitorRecord(val numRegs: Int, val counterBits: Int) extends Bundle
-{
-  val window = UInt(32.W)
-  val preg   = UInt(log2Ceil(numRegs).W)
-  val reads  = UInt(counterBits.W)
-  val writes = UInt(counterBits.W)
-}
-
 /**
  * @param name register file tag ("int" / "fp")
  * @param hartId static tile id, used to name output files
@@ -74,216 +63,44 @@ class RegFileMonitor(
   addrWidth: Int,
   params: RegFileMonitorParams) extends Module
 {
-  private val windowCycles = params.windowCycles
-
   // Every port can hit the same register in a cycle.
-  private val maxCount    = BigInt(windowCycles) * (numReadPorts max numWritePorts)
+  private val maxCount    = BigInt(params.windowCycles) * (numReadPorts max numWritePorts)
   val counterBits: Int    = params.counterBits.getOrElse(log2Ceil(maxCount + 1))
 
-  // The snapshot must be fully streamed out before the next window ends.
-  require(windowCycles > numRegs,
-    s"RegFileMonitor($name): windowCycles ($windowCycles) must exceed numRegs ($numRegs)")
   require(maxCount < (BigInt(1) << counterBits),
-    s"RegFileMonitor($name): counterBits ($counterBits) too small for windowCycles ($windowCycles)")
-  require(!params.dpiLog || counterBits <= 32,
-    s"RegFileMonitor($name): dpiLog supports at most 32-bit counters")
+    s"RegFileMonitor($name): counterBits ($counterBits) too small for windowCycles (${params.windowCycles})")
+
+  val logInfo = MonitorLogInfo("regfile", name, hartId, Seq("reads", "writes"), numRegs)
 
   val io = IO(new Bundle {
     val reads  = Input(Vec(numReadPorts, Valid(UInt(addrWidth.W))))
     val writes = Input(Vec(numWritePorts, Valid(UInt(addrWidth.W))))
-    val dump   = Output(Valid(new RegFileMonitorRecord(numRegs, counterBits)))
+    val dump   = Output(Valid(new MonitorRecord(numRegs, 2, counterBits)))
   })
 
-  // --------------------------------------------------------------
-  // Window timing
-
-  val cycle     = RegInit(0.U(log2Ceil(windowCycles).W))
-  val windowEnd = cycle === (windowCycles - 1).U
-  cycle := Mux(windowEnd, 0.U, cycle + 1.U)
-
-  val windowId = RegInit(0.U(32.W))
+  val log = Module(new MonitorLogger(logInfo, counterBits, params.windowCycles,
+    params.dpiLog, params.printDump))
+  io.dump := log.io.dump
 
   // --------------------------------------------------------------
-  // Live counters and end-of-window snapshot
+  // Live counters
 
-  val rdCnt  = RegInit(VecInit(Seq.fill(numRegs)(0.U(counterBits.W))))
-  val wrCnt  = RegInit(VecInit(Seq.fill(numRegs)(0.U(counterBits.W))))
-  val rdSnap = Reg(Vec(numRegs, UInt(counterBits.W)))
-  val wrSnap = Reg(Vec(numRegs, UInt(counterBits.W)))
+  val rdCnt = RegInit(VecInit(Seq.fill(numRegs)(0.U(counterBits.W))))
+  val wrCnt = RegInit(VecInit(Seq.fill(numRegs)(0.U(counterBits.W))))
 
   for (r <- 0 until numRegs) {
-    val rdHits = PopCount(io.reads.map(e => e.valid && e.bits === r.U))
-    val wrHits = PopCount(io.writes.map(e => e.valid && e.bits === r.U))
-    val rdNext = rdCnt(r) + rdHits
-    val wrNext = wrCnt(r) + wrHits
+    val rdNext = rdCnt(r) + PopCount(io.reads.map(e => e.valid && e.bits === r.U))
+    val wrNext = wrCnt(r) + PopCount(io.writes.map(e => e.valid && e.bits === r.U))
 
     // Events in the last cycle of a window belong to that window.
-    rdCnt(r) := Mux(windowEnd, 0.U, rdNext)
-    wrCnt(r) := Mux(windowEnd, 0.U, wrNext)
-    when (windowEnd) {
-      rdSnap(r) := rdNext
-      wrSnap(r) := wrNext
-    }
+    rdCnt(r) := Mux(log.io.windowEnd, 0.U, rdNext)
+    wrCnt(r) := Mux(log.io.windowEnd, 0.U, wrNext)
+
+    log.io.snap(0)(r) := rdNext
+    log.io.snap(1)(r) := wrNext
+    log.io.live(0)(r) := rdCnt(r)
+    log.io.live(1)(r) := wrCnt(r)
   }
-
-  // --------------------------------------------------------------
-  // Stream the snapshot out, one register per cycle
-
-  val dumping    = RegInit(false.B)
-  val dumpIdx    = RegInit(0.U(log2Ceil(numRegs).W))
-  val dumpWindow = RegInit(0.U(32.W))
-
-  when (windowEnd) {
-    dumping    := true.B
-    dumpIdx    := 0.U
-    dumpWindow := windowId
-    windowId   := windowId + 1.U
-  } .elsewhen (dumping) {
-    dumpIdx := dumpIdx + 1.U
-    when (dumpIdx === (numRegs - 1).U) {
-      dumping := false.B
-    }
-  }
-
-  io.dump.valid       := dumping
-  io.dump.bits.window := dumpWindow
-  io.dump.bits.preg   := dumpIdx
-  io.dump.bits.reads  := rdSnap(dumpIdx)
-  io.dump.bits.writes := wrSnap(dumpIdx)
-
-  // --------------------------------------------------------------
-  // Sinks
-
-  if (params.dpiLog) {
-    val rfType = name match {
-      case "int" => 0
-      case "fp"  => 1
-      case _     => throw new IllegalArgumentException(s"RegFileMonitor: unknown register file '$name'")
-    }
-    val dpi = Module(new RegFileMonitorDPI(name, rfType, hartId, numRegs, counterBits, windowCycles))
-    dpi.io.clock        := clock
-    dpi.io.reset        := reset.asBool
-    dpi.io.dump_valid   := io.dump.valid
-    dpi.io.dump_preg    := io.dump.bits.preg
-    dpi.io.dump_reads   := io.dump.bits.reads
-    dpi.io.dump_writes  := io.dump.bits.writes
-    dpi.io.dumping      := dumping
-    dpi.io.window_cycle := cycle
-    dpi.io.live_reads   := rdCnt.asUInt
-    dpi.io.live_writes  := wrCnt.asUInt
-    dpi.io.snap_reads   := rdSnap.asUInt
-    dpi.io.snap_writes  := wrSnap.asUInt
-  }
-
-  if (params.printDump) {
-    when (io.dump.valid) {
-      printf(s"[regmon-$name] window=%d preg=%d reads=%d writes=%d\n",
-        io.dump.bits.window, io.dump.bits.preg, io.dump.bits.reads, io.dump.bits.writes)
-    }
-  }
-}
-
-/**
- * DPI-C sink for RegFileMonitor. Writes each dumped record to a binary file
- * and, in a `final` block, completes any window still being streamed and
- * appends the trailing partial window from the live counters.
- *
- * The Verilog is generated per instance so each gets a unique module name
- * with its widths baked in. Plusargs:
- *   +regmon_prefix=<path>  output file prefix (default "regmon"); files are
- *                          <prefix>_<int|fp>_hart<N>.bin
- *   +regmon_off            disable file output
- */
-class RegFileMonitorDPI(
-  name: String,
-  rfType: Int,
-  hartId: Int,
-  numRegs: Int,
-  counterBits: Int,
-  windowCycles: Int) extends BlackBox with HasBlackBoxInline with HasBlackBoxResource
-{
-  private val pregBits  = log2Ceil(numRegs)
-  private val wideBits  = numRegs * counterBits
-  private val cycleBits = log2Ceil(windowCycles)
-
-  val io = IO(new Bundle {
-    val clock        = Input(Clock())
-    val reset        = Input(Bool())
-    val dump_valid   = Input(Bool())
-    val dump_preg    = Input(UInt(pregBits.W))
-    val dump_reads   = Input(UInt(counterBits.W))
-    val dump_writes  = Input(UInt(counterBits.W))
-    val dumping      = Input(Bool())
-    val window_cycle = Input(UInt(cycleBits.W))
-    val live_reads   = Input(UInt(wideBits.W))
-    val live_writes  = Input(UInt(wideBits.W))
-    val snap_reads   = Input(UInt(wideBits.W))
-    val snap_writes  = Input(UInt(wideBits.W))
-  })
-
-  override def desiredName = s"RegFileMonitorDPI_${name}_hart${hartId}"
-
-  addResource("/csrc/regfile_monitor.cc")
-
-  setInline(s"$desiredName.v",
-    s"""module $desiredName (
-       |  input                     clock,
-       |  input                     reset,
-       |  input                     dump_valid,
-       |  input  [${pregBits-1}:0]  dump_preg,
-       |  input  [${counterBits-1}:0] dump_reads,
-       |  input  [${counterBits-1}:0] dump_writes,
-       |  input                     dumping,
-       |  input  [${cycleBits-1}:0] window_cycle,
-       |  input  [${wideBits-1}:0]  live_reads,
-       |  input  [${wideBits-1}:0]  live_writes,
-       |  input  [${wideBits-1}:0]  snap_reads,
-       |  input  [${wideBits-1}:0]  snap_writes
-       |);
-       |  import "DPI-C" function chandle regmon_open(input string prefix, input string name,
-       |    input int rf_type, input int hart_id, input int num_regs, input int counter_bits,
-       |    input longint window_cycles);
-       |  import "DPI-C" function void regmon_record(input chandle h, input int preg,
-       |    input int reads, input int writes);
-       |  import "DPI-C" function void regmon_final_begin(input chandle h, input int dumping);
-       |  import "DPI-C" function void regmon_final_snap(input chandle h, input int preg,
-       |    input int reads, input int writes);
-       |  import "DPI-C" function void regmon_final_live(input chandle h, input int preg,
-       |    input int reads, input int writes);
-       |  import "DPI-C" function void regmon_close(input chandle h, input int window_cycle);
-       |
-       |  localparam W = $counterBits;
-       |  localparam N = $numRegs;
-       |
-       |  chandle h;
-       |  string  prefix;
-       |  integer i;
-       |
-       |  initial begin
-       |    h = null;
-       |    if (!$$test$$plusargs("regmon_off")) begin
-       |      if (!$$value$$plusargs("regmon_prefix=%s", prefix)) prefix = "regmon";
-       |      h = regmon_open(prefix, "$name", $rfType, $hartId, N, W, ${windowCycles});
-       |    end
-       |  end
-       |
-       |  always @(posedge clock) begin
-       |    if (!reset && dump_valid && h != null)
-       |      regmon_record(h, int'(dump_preg), int'(dump_reads), int'(dump_writes));
-       |  end
-       |
-       |  final begin
-       |    if (h != null) begin
-       |      regmon_final_begin(h, int'(dumping));
-       |      for (i = 0; i < N; i = i + 1)
-       |        regmon_final_snap(h, i, int'(snap_reads[i*W +: W]), int'(snap_writes[i*W +: W]));
-       |      for (i = 0; i < N; i = i + 1)
-       |        regmon_final_live(h, i, int'(live_reads[i*W +: W]), int'(live_writes[i*W +: W]));
-       |      regmon_close(h, int'(window_cycle));
-       |    end
-       |  end
-       |endmodule
-       |""".stripMargin)
 }
 
 object RegFileMonitor

@@ -1190,6 +1190,15 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
       iregfile.io.write_ports, mp)
   }
 
+  // Execution unit and free list monitors (passive observers, see boom.monitors)
+  boomParams.exeUnitMonitor.foreach { mp =>
+    boom.monitors.ExeUnitMonitor("exu_int", tileId, exe_units, mp)
+  }
+  boomParams.freeListMonitor.foreach { mp =>
+    boom.monitors.FreeListMonitor("freelist_int", tileId, numIntPhysRegs, rename_stage, mp)
+    if (usingFPU) boom.monitors.FreeListMonitor("freelist_fp", tileId, numFpPhysRegs, fp_rename_stage, mp)
+  }
+
   if (enableSFBOpt) {
     pregfile.io.write_ports(0).valid     := jmp_unit.io.iresp.valid && jmp_unit.io.iresp.bits.uop.is_sfb_br
     pregfile.io.write_ports(0).bits.addr := jmp_unit.io.iresp.bits.uop.pdst

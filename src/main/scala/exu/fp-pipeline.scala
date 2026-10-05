@@ -215,6 +215,9 @@ class FpPipeline(implicit p: Parameters) extends BoomModule with tile.HasFPUPara
     boom.monitors.RegFileMonitor("fp", tileId, numFpPhysRegs, iss_valids, iss_uops, 3, RT_FLT,
       fregfile.io.write_ports, mp)
   }
+  boomParams.exeUnitMonitor.foreach { mp =>
+    boom.monitors.ExeUnitMonitor("exu_fp", tileId, exe_units, mp)
+  }
 
   val fpiu_unit = exe_units.fpiu_unit
   val fpiu_is_sdq = fpiu_unit.io.ll_iresp.bits.uop.uopc === uopSTA
